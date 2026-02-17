@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
 /**
  * @title AlphArena
  * @notice Arena contract for the AlphArena AI agent competition platform.
- *         Manages escrow, payout, and refund of native ETH for agent matches.
- * @dev Uses checks-effects-interactions pattern for reentrancy protection.
+ *         Manages escrow, payout, and refund of USDC for agent matches.
+ * @dev Uses SafeERC20 for all token transfers. USDC has 6 decimals.
  *      Access control: owner (admin) and operator (match lifecycle).
+ *      Deployable on Base mainnet and Base Sepolia with the corresponding USDC address.
  */
 contract AlphArena {
+    using SafeERC20 for IERC20;
+
     // -----------------------------------------------------------------------
     //  Types
     // -----------------------------------------------------------------------
@@ -23,13 +29,15 @@ contract AlphArena {
     struct MatchInfo {
         address agentA;
         address agentB;
-        uint256 amount;
+        uint256 amount; // USDC amount (6 decimals)
         MatchState state;
     }
 
     // -----------------------------------------------------------------------
     //  State
     // -----------------------------------------------------------------------
+
+    IERC20 public immutable usdc;
 
     address public owner;
     address public operator;
@@ -72,10 +80,8 @@ contract AlphArena {
     error MatchAlreadyExists();
     error MatchNotEscrowed();
     error InvalidAmount();
-    error InsufficientValue();
     error InvalidWinner();
     error PayoutExceedsEscrow();
-    error TransferFailed();
     error NoFeesToWithdraw();
 
     // -----------------------------------------------------------------------
@@ -96,7 +102,14 @@ contract AlphArena {
     //  Constructor
     // -----------------------------------------------------------------------
 
-    constructor() {
+    /**
+     * @param _usdc Address of the USDC token contract.
+     *              Base mainnet:  0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
+     *              Base Sepolia:  0x036CbD53842c5426634e7929541eC2318f3dCF7e
+     */
+    constructor(address _usdc) {
+        if (_usdc == address(0)) revert ZeroAddress();
+        usdc = IERC20(_usdc);
         owner = msg.sender;
     }
 
@@ -127,18 +140,15 @@ contract AlphArena {
     }
 
     /**
-     * @notice Withdraw accumulated platform fees to the owner.
+     * @notice Withdraw accumulated platform fees (USDC) to the owner.
      */
     function withdrawFees() external onlyOwner {
         uint256 amount = accumulatedFees;
         if (amount == 0) revert NoFeesToWithdraw();
 
-        // Effects before interactions
         accumulatedFees = 0;
 
-        // Interaction
-        (bool success, ) = payable(owner).call{value: amount}("");
-        if (!success) revert TransferFailed();
+        usdc.safeTransfer(owner, amount);
 
         emit FeesWithdrawn(owner, amount);
     }
@@ -148,26 +158,23 @@ contract AlphArena {
     // -----------------------------------------------------------------------
 
     /**
-     * @notice Escrow funds for a match between two agents.
+     * @notice Escrow USDC for a match between two agents.
      * @param matchId Unique identifier for the match.
-     * @param agentA  Address of the first agent.
-     * @param agentB  Address of the second agent.
-     * @param amount  The amount to escrow (must be <= msg.value).
-     * @dev Any excess ETH sent above `amount` is recorded as platform fees.
+     * @param agentA  Address of the first agent's owner.
+     * @param agentB  Address of the second agent's owner.
+     * @param amount  The USDC amount to escrow (6 decimals).
+     * @dev The operator must have approved this contract for at least `amount` USDC.
      */
     function escrowFunds(
         bytes32 matchId,
         address agentA,
         address agentB,
         uint256 amount
-    ) external payable onlyOperator {
-        // Checks
+    ) external onlyOperator {
         if (matches[matchId].state != MatchState.None) revert MatchAlreadyExists();
         if (agentA == address(0) || agentB == address(0)) revert ZeroAddress();
         if (amount == 0) revert InvalidAmount();
-        if (msg.value < amount) revert InsufficientValue();
 
-        // Effects
         matches[matchId] = MatchInfo({
             agentA: agentA,
             agentB: agentB,
@@ -175,19 +182,16 @@ contract AlphArena {
             state: MatchState.Escrowed
         });
 
-        // Any excess value is accumulated as platform fees
-        if (msg.value > amount) {
-            accumulatedFees += msg.value - amount;
-        }
+        usdc.safeTransferFrom(msg.sender, address(this), amount);
 
         emit FundsEscrowed(matchId, agentA, agentB, amount);
     }
 
     /**
-     * @notice Release payout to the match winner.
+     * @notice Release USDC payout to the match winner.
      * @param matchId Unique identifier for the match.
-     * @param winner  Address of the winning agent (must be agentA or agentB).
-     * @param amount  Amount to pay the winner (must be <= escrowed amount).
+     * @param winner  Address of the winning agent's owner (must be agentA or agentB).
+     * @param amount  USDC amount to pay the winner (must be <= escrowed amount).
      * @dev Any remaining escrow after payout is recorded as platform fees.
      */
     function releasePayout(
@@ -197,13 +201,11 @@ contract AlphArena {
     ) external onlyOperator {
         MatchInfo storage m = matches[matchId];
 
-        // Checks
         if (m.state != MatchState.Escrowed) revert MatchNotEscrowed();
         if (winner != m.agentA && winner != m.agentB) revert InvalidWinner();
         if (amount == 0) revert InvalidAmount();
         if (amount > m.amount) revert PayoutExceedsEscrow();
 
-        // Effects – update state before external call
         uint256 remainder = m.amount - amount;
         m.state = MatchState.Settled;
         m.amount = 0;
@@ -212,9 +214,7 @@ contract AlphArena {
             accumulatedFees += remainder;
         }
 
-        // Interaction
-        (bool success, ) = payable(winner).call{value: amount}("");
-        if (!success) revert TransferFailed();
+        usdc.safeTransfer(winner, amount);
 
         emit PayoutReleased(matchId, winner, amount);
     }
@@ -226,10 +226,8 @@ contract AlphArena {
     function refundMatch(bytes32 matchId) external onlyOperator {
         MatchInfo storage m = matches[matchId];
 
-        // Checks
         if (m.state != MatchState.Escrowed) revert MatchNotEscrowed();
 
-        // Effects – update state before external calls
         address agentA = m.agentA;
         address agentB = m.agentB;
         uint256 totalAmount = m.amount;
@@ -238,18 +236,13 @@ contract AlphArena {
         m.state = MatchState.Refunded;
         m.amount = 0;
 
-        // Any remainder from odd-amount rounding goes to fees
         uint256 remainder = totalAmount - (halfAmount * 2);
         if (remainder > 0) {
             accumulatedFees += remainder;
         }
 
-        // Interactions
-        (bool successA, ) = payable(agentA).call{value: halfAmount}("");
-        if (!successA) revert TransferFailed();
-
-        (bool successB, ) = payable(agentB).call{value: halfAmount}("");
-        if (!successB) revert TransferFailed();
+        usdc.safeTransfer(agentA, halfAmount);
+        usdc.safeTransfer(agentB, halfAmount);
 
         emit MatchRefunded(matchId);
     }
@@ -260,8 +253,6 @@ contract AlphArena {
 
     /**
      * @notice Get the state of a match.
-     * @param matchId The match identifier.
-     * @return The current MatchState.
      */
     function getMatchState(bytes32 matchId) external view returns (MatchState) {
         return matches[matchId].state;
@@ -269,11 +260,6 @@ contract AlphArena {
 
     /**
      * @notice Get full match info.
-     * @param matchId The match identifier.
-     * @return agentA  Address of agent A.
-     * @return agentB  Address of agent B.
-     * @return amount  Escrowed amount (0 if settled/refunded).
-     * @return state   Current match state.
      */
     function getMatchInfo(bytes32 matchId)
         external
@@ -287,5 +273,12 @@ contract AlphArena {
     {
         MatchInfo storage m = matches[matchId];
         return (m.agentA, m.agentB, m.amount, m.state);
+    }
+
+    /**
+     * @notice Get the USDC balance held by this contract.
+     */
+    function getContractBalance() external view returns (uint256) {
+        return usdc.balanceOf(address(this));
     }
 }
