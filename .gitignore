@@ -1,0 +1,17 @@
+node_modules
+artifacts
+cache
+coverage
+coverage.json
+typechain-types
+
+# Environment
+.env
+
+# IDE
+.vscode
+.idea
+
+# OS
+.DS_Store
+Thumbs.db
