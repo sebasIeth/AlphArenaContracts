@@ -8,8 +8,12 @@
     "deploy:localhost": "hardhat run scripts/deploy.ts --network localhost",
     "deploy:baseSepolia": "hardhat run scripts/deploy.ts --network baseSepolia",
     "deploy:base": "hardhat run scripts/deploy.ts --network base",
+    "deploy:celo": "hardhat run scripts/deploy.ts --network celo",
+    "deploy:celoSepolia": "hardhat run scripts/deploy.ts --network celoSepolia",
     "verify:baseSepolia": "hardhat verify --network baseSepolia",
     "verify:base": "hardhat verify --network base",
+    "verify:celo": "hardhat verify --network celo",
+    "verify:celoSepolia": "hardhat verify --network celoSepolia",
     "node": "hardhat node",
     "clean": "hardhat clean"
   },

@@ -7,10 +7,11 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 /**
  * @title AlphArena
  * @notice Arena contract for the AlphArena AI agent competition platform.
- *         Manages escrow, payout, and refund of USDC for agent matches.
- * @dev Uses SafeERC20 for all token transfers. USDC has 6 decimals.
+ *         Manages escrow, payout, and refund of ALPHA tokens for agent matches.
+ *         Supports side-betting: third parties can bet on match outcomes.
+ * @dev Uses SafeERC20 for all token transfers. ALPHA has 18 decimals.
  *      Access control: owner (admin) and operator (match lifecycle).
- *      Deployable on Base mainnet and Base Sepolia with the corresponding USDC address.
+ *      Betting: anyone can bet while a match is Escrowed. 5% platform fee on betting pool.
  */
 contract AlphArena {
     using SafeERC20 for IERC20;
@@ -29,21 +30,41 @@ contract AlphArena {
     struct MatchInfo {
         address agentA;
         address agentB;
-        uint256 amount; // USDC amount (6 decimals)
+        uint256 amount; // ALPHA token amount (18 decimals)
         MatchState state;
     }
+
+    struct BettingPool {
+        uint256 totalBetsA;
+        uint256 totalBetsB;
+        uint256 netPool;   // total pool minus fee, set on settlement
+        bool noContest;    // true if all bets on one side (refund scenario)
+    }
+
+    // -----------------------------------------------------------------------
+    //  Constants
+    // -----------------------------------------------------------------------
+
+    uint256 public constant BET_FEE_BPS = 500; // 5% (500 basis points)
 
     // -----------------------------------------------------------------------
     //  State
     // -----------------------------------------------------------------------
 
-    IERC20 public immutable usdc;
+    IERC20 public immutable alpha;
 
     address public owner;
     address public operator;
     uint256 public accumulatedFees;
 
     mapping(bytes32 => MatchInfo) public matches;
+    mapping(bytes32 => address) public matchWinner;
+
+    // Betting state
+    mapping(bytes32 => BettingPool) public bettingPools;
+    mapping(bytes32 => mapping(address => uint256)) public betsOnA;
+    mapping(bytes32 => mapping(address => uint256)) public betsOnB;
+    mapping(bytes32 => mapping(address => bool)) public betClaimed;
 
     // -----------------------------------------------------------------------
     //  Events
@@ -70,6 +91,19 @@ contract AlphArena {
 
     event FeesWithdrawn(address indexed to, uint256 amount);
 
+    event BetPlaced(
+        bytes32 indexed matchId,
+        address indexed bettor,
+        bool onAgentA,
+        uint256 amount
+    );
+
+    event BetClaimed(
+        bytes32 indexed matchId,
+        address indexed bettor,
+        uint256 payout
+    );
+
     // -----------------------------------------------------------------------
     //  Errors
     // -----------------------------------------------------------------------
@@ -83,6 +117,10 @@ contract AlphArena {
     error InvalidWinner();
     error PayoutExceedsEscrow();
     error NoFeesToWithdraw();
+    error BettingClosed();
+    error NoBetToClaim();
+    error AlreadyClaimed();
+    error MatchNotFinalized();
 
     // -----------------------------------------------------------------------
     //  Modifiers
@@ -103,13 +141,12 @@ contract AlphArena {
     // -----------------------------------------------------------------------
 
     /**
-     * @param _usdc Address of the USDC token contract.
-     *              Base mainnet:  0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
-     *              Base Sepolia:  0x036CbD53842c5426634e7929541eC2318f3dCF7e
+     * @param _alpha Address of the ALPHA token contract.
+     *               Base mainnet: 0x324f2BD09e908f28217CC19Bb9599b199c736bA3
      */
-    constructor(address _usdc) {
-        if (_usdc == address(0)) revert ZeroAddress();
-        usdc = IERC20(_usdc);
+    constructor(address _alpha) {
+        if (_alpha == address(0)) revert ZeroAddress();
+        alpha = IERC20(_alpha);
         owner = msg.sender;
     }
 
@@ -140,7 +177,7 @@ contract AlphArena {
     }
 
     /**
-     * @notice Withdraw accumulated platform fees (USDC) to the owner.
+     * @notice Withdraw accumulated platform fees (ALPHA) to the owner.
      */
     function withdrawFees() external onlyOwner {
         uint256 amount = accumulatedFees;
@@ -148,7 +185,7 @@ contract AlphArena {
 
         accumulatedFees = 0;
 
-        usdc.safeTransfer(owner, amount);
+        alpha.safeTransfer(owner, amount);
 
         emit FeesWithdrawn(owner, amount);
     }
@@ -158,12 +195,12 @@ contract AlphArena {
     // -----------------------------------------------------------------------
 
     /**
-     * @notice Escrow USDC for a match between two agents.
+     * @notice Escrow ALPHA tokens for a match between two agents.
      * @param matchId Unique identifier for the match.
      * @param agentA  Address of the first agent's owner.
      * @param agentB  Address of the second agent's owner.
-     * @param amount  The USDC amount to escrow (6 decimals).
-     * @dev The operator must have approved this contract for at least `amount` USDC.
+     * @param amount  The ALPHA token amount to escrow (18 decimals).
+     * @dev The operator must have approved this contract for at least `amount` ALPHA.
      */
     function escrowFunds(
         bytes32 matchId,
@@ -182,17 +219,19 @@ contract AlphArena {
             state: MatchState.Escrowed
         });
 
-        usdc.safeTransferFrom(msg.sender, address(this), amount);
+        alpha.safeTransferFrom(msg.sender, address(this), amount);
 
         emit FundsEscrowed(matchId, agentA, agentB, amount);
     }
 
     /**
-     * @notice Release USDC payout to the match winner.
+     * @notice Release ALPHA payout to the match winner and settle the betting pool.
      * @param matchId Unique identifier for the match.
      * @param winner  Address of the winning agent's owner (must be agentA or agentB).
-     * @param amount  USDC amount to pay the winner (must be <= escrowed amount).
+     * @param amount  ALPHA amount to pay the winner (must be <= escrowed amount).
      * @dev Any remaining escrow after payout is recorded as platform fees.
+     *      Also settles the betting pool: 5% fee on total bets, rest claimable by winners.
+     *      If no bets on the losing side, all bettors are refunded (no fee).
      */
     function releasePayout(
         bytes32 matchId,
@@ -209,18 +248,40 @@ contract AlphArena {
         uint256 remainder = m.amount - amount;
         m.state = MatchState.Settled;
         m.amount = 0;
+        matchWinner[matchId] = winner;
 
         if (remainder > 0) {
             accumulatedFees += remainder;
         }
 
-        usdc.safeTransfer(winner, amount);
+        alpha.safeTransfer(winner, amount);
+
+        // Settle betting pool
+        BettingPool storage pool = bettingPools[matchId];
+        uint256 totalPool = pool.totalBetsA + pool.totalBetsB;
+
+        if (totalPool > 0) {
+            bool winnerIsA = (winner == m.agentA);
+            uint256 losingPool = winnerIsA ? pool.totalBetsB : pool.totalBetsA;
+
+            if (losingPool == 0) {
+                // No opposing bets — refund all bettors, no fee
+                pool.noContest = true;
+                pool.netPool = totalPool;
+            } else {
+                // Take 5% fee from total betting pool
+                uint256 fee = (totalPool * BET_FEE_BPS) / 10000;
+                accumulatedFees += fee;
+                pool.netPool = totalPool - fee;
+            }
+        }
 
         emit PayoutReleased(matchId, winner, amount);
     }
 
     /**
      * @notice Refund both agents equally for a cancelled match.
+     *         All bets are also refundable via claimBet().
      * @param matchId Unique identifier for the match.
      */
     function refundMatch(bytes32 matchId) external onlyOperator {
@@ -236,15 +297,102 @@ contract AlphArena {
         m.state = MatchState.Refunded;
         m.amount = 0;
 
-        uint256 remainder = totalAmount - (halfAmount * 2);
-        if (remainder > 0) {
-            accumulatedFees += remainder;
+        uint256 escrowRemainder = totalAmount - (halfAmount * 2);
+        if (escrowRemainder > 0) {
+            accumulatedFees += escrowRemainder;
         }
 
-        usdc.safeTransfer(agentA, halfAmount);
-        usdc.safeTransfer(agentB, halfAmount);
+        alpha.safeTransfer(agentA, halfAmount);
+        alpha.safeTransfer(agentB, halfAmount);
 
         emit MatchRefunded(matchId);
+    }
+
+    // -----------------------------------------------------------------------
+    //  Betting (public)
+    // -----------------------------------------------------------------------
+
+    /**
+     * @notice Place a bet on a match outcome.
+     * @param matchId  The match to bet on (must be in Escrowed state).
+     * @param onAgentA True to bet on agentA winning, false for agentB.
+     * @param amount   ALPHA amount to bet (18 decimals).
+     * @dev Caller must have approved this contract for `amount` ALPHA.
+     *      Multiple bets on the same side are accumulated.
+     */
+    function placeBet(
+        bytes32 matchId,
+        bool onAgentA,
+        uint256 amount
+    ) external {
+        if (matches[matchId].state != MatchState.Escrowed) revert BettingClosed();
+        if (amount == 0) revert InvalidAmount();
+
+        BettingPool storage pool = bettingPools[matchId];
+
+        if (onAgentA) {
+            betsOnA[matchId][msg.sender] += amount;
+            pool.totalBetsA += amount;
+        } else {
+            betsOnB[matchId][msg.sender] += amount;
+            pool.totalBetsB += amount;
+        }
+
+        alpha.safeTransferFrom(msg.sender, address(this), amount);
+
+        emit BetPlaced(matchId, msg.sender, onAgentA, amount);
+    }
+
+    /**
+     * @notice Claim bet winnings (or refund) after a match is settled or refunded.
+     * @param matchId The match to claim from.
+     * @dev - Settled + noContest (no opposing bets): full refund, no fee.
+     *      - Settled + contest: winners get proportional share of 95% of total pool.
+     *      - Refunded: full refund of all bets, no fee.
+     */
+    function claimBet(bytes32 matchId) external {
+        MatchInfo storage m = matches[matchId];
+        if (m.state != MatchState.Settled && m.state != MatchState.Refunded) {
+            revert MatchNotFinalized();
+        }
+        if (betClaimed[matchId][msg.sender]) revert AlreadyClaimed();
+
+        uint256 betA = betsOnA[matchId][msg.sender];
+        uint256 betB = betsOnB[matchId][msg.sender];
+        if (betA == 0 && betB == 0) revert NoBetToClaim();
+
+        betClaimed[matchId][msg.sender] = true;
+
+        uint256 payout = 0;
+
+        if (m.state == MatchState.Refunded) {
+            // Match cancelled — refund all bets
+            payout = betA + betB;
+        } else {
+            BettingPool storage pool = bettingPools[matchId];
+
+            if (pool.noContest) {
+                // No opposing bets — refund all bets
+                payout = betA + betB;
+            } else {
+                // Distribute winnings proportionally
+                address winner = matchWinner[matchId];
+                bool winnerIsA = (winner == m.agentA);
+                uint256 userWinningBet = winnerIsA ? betA : betB;
+                uint256 winningPool = winnerIsA ? pool.totalBetsA : pool.totalBetsB;
+
+                if (userWinningBet > 0 && winningPool > 0) {
+                    payout = (userWinningBet * pool.netPool) / winningPool;
+                }
+                // Losers get nothing
+            }
+        }
+
+        if (payout > 0) {
+            alpha.safeTransfer(msg.sender, payout);
+        }
+
+        emit BetClaimed(matchId, msg.sender, payout);
     }
 
     // -----------------------------------------------------------------------
@@ -276,9 +424,41 @@ contract AlphArena {
     }
 
     /**
-     * @notice Get the USDC balance held by this contract.
+     * @notice Get betting pool info for a match.
+     */
+    function getBettingPool(bytes32 matchId)
+        external
+        view
+        returns (
+            uint256 totalBetsA,
+            uint256 totalBetsB,
+            uint256 netPool,
+            bool noContest
+        )
+    {
+        BettingPool storage pool = bettingPools[matchId];
+        return (pool.totalBetsA, pool.totalBetsB, pool.netPool, pool.noContest);
+    }
+
+    /**
+     * @notice Get a user's bets on a match.
+     */
+    function getUserBets(bytes32 matchId, address user)
+        external
+        view
+        returns (uint256 betOnA, uint256 betOnB, bool claimed)
+    {
+        return (
+            betsOnA[matchId][user],
+            betsOnB[matchId][user],
+            betClaimed[matchId][user]
+        );
+    }
+
+    /**
+     * @notice Get the ALPHA token balance held by this contract.
      */
     function getContractBalance() external view returns (uint256) {
-        return usdc.balanceOf(address(this));
+        return alpha.balanceOf(address(this));
     }
 }

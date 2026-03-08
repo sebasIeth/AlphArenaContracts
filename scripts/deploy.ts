@@ -1,9 +1,9 @@
 import { ethers, network } from "hardhat";
 
-// USDC addresses per network
-const USDC_ADDRESSES: Record<string, string> = {
-  base: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",       // Base mainnet
-  baseSepolia: "0x036CbD53842c5426634e7929541eC2318f3dCF7e", // Base Sepolia
+// ALPHA token addresses per network
+const ALPHA_ADDRESSES: Record<string, string> = {
+  base: "0x324f2BD09e908f28217CC19Bb9599b199c736bA3", // Base mainnet
+  celo: "0x3B825bED44D0daa21a7e960B913848baebB9c869", // Celo mainnet
 };
 
 async function main() {
@@ -18,49 +18,45 @@ async function main() {
     "ETH"
   );
 
-  // Resolve USDC address
-  let usdcAddress = USDC_ADDRESSES[networkName];
+  // Resolve ALPHA token address
+  let alphaAddress = ALPHA_ADDRESSES[networkName];
 
-  if (!usdcAddress) {
-    // For localhost/hardhat: deploy a mock ERC20 for testing
-    if (networkName === "localhost" || networkName === "hardhat") {
-      console.log("\nLocal network detected — deploying MockUSDC...");
-      const MockUSDC = await ethers.getContractFactory("MockUSDC");
-      const mockUsdc = await MockUSDC.deploy();
-      await mockUsdc.waitForDeployment();
-      usdcAddress = await mockUsdc.getAddress();
-      console.log("MockUSDC deployed to:", usdcAddress);
+  if (!alphaAddress) {
+    // For localhost/hardhat/testnet: deploy a mock ALPHA token
+    if (["localhost", "hardhat", "baseSepolia", "celoSepolia"].includes(networkName)) {
+      console.log("\nTest network detected — deploying MockALPHA...");
+      const MockALPHA = await ethers.getContractFactory("MockALPHA");
+      const mockAlpha = await MockALPHA.deploy();
+      await mockAlpha.waitForDeployment();
+      alphaAddress = await mockAlpha.getAddress();
+      console.log("MockALPHA deployed to:", alphaAddress);
     } else {
       throw new Error(
-        `No USDC address configured for network "${networkName}". ` +
-        `Supported networks: ${Object.keys(USDC_ADDRESSES).join(", ")}`
+        `No ALPHA address configured for network "${networkName}". ` +
+        `Supported networks: ${Object.keys(ALPHA_ADDRESSES).join(", ")}`
       );
     }
   }
 
-  console.log("USDC address:", usdcAddress);
+  console.log("ALPHA address:", alphaAddress);
 
   // Deploy AlphArena
   const AlphArena = await ethers.getContractFactory("AlphArena");
-  const arena = await AlphArena.deploy(usdcAddress);
+  const arena = await AlphArena.deploy(alphaAddress);
   await arena.waitForDeployment();
 
   const arenaAddress = await arena.getAddress();
   console.log("\nAlphArena deployed to:", arenaAddress);
 
-  // Auto-set operator on local/test networks
-  if (networkName === "localhost" || networkName === "hardhat" || networkName === "baseSepolia") {
-    const tx = await arena.setOperator(deployer.address);
-    await tx.wait();
-    console.log("Operator set to deployer:", deployer.address);
-  } else {
-    console.log("Remember to call setOperator() with the backend operator address.");
-  }
+  // Auto-set operator to deployer
+  const tx = await arena.setOperator(deployer.address);
+  await tx.wait();
+  console.log("Operator set to deployer:", deployer.address);
 
   console.log("\n--- Deployment Summary ---");
   console.log("Network:          ", networkName);
   console.log("AlphArena:        ", arenaAddress);
-  console.log("USDC:             ", usdcAddress);
+  console.log("ALPHA:            ", alphaAddress);
   console.log("Owner:            ", deployer.address);
 }
 
